@@ -68,10 +68,8 @@ import {
 import type { EventsTableFilterState, FilterState } from "../../types";
 import type { TracingSearchType } from "../../interfaces/search";
 import {
-  eventsSessionsAggregation,
   eventsTracesAggregation,
   eventsTracesScoresAggregation,
-  promptEventsForMetrics,
 } from "../queries/clickhouse-sql/query-fragments";
 import {
   eventsTableNativeUiColumnDefinitions,
@@ -118,6 +116,8 @@ import {
   EventsAggQueryBuilder,
   buildEventsFullTableSplitQuery,
   EVENTS_AGGREGATION_FIELDS,
+  EVENTS_SESSION_AGGREGATION_FIELDS,
+  SESSION_AGGREGATION_FIELD_SETS,
   eventsFieldSetSelectExpressions,
   type QueryWithParams,
   type SessionEventsMetricsRow,
@@ -141,7 +141,10 @@ import {
   normalizeEventsTraceName,
   type NumericEventsTableColumnId,
 } from "../../eventsTable";
-import { OBSERVATIONS_TO_TRACE_INTERVAL_DAYS } from "./constants";
+import {
+  OBSERVATIONS_TO_TRACE_INTERVAL,
+  OBSERVATIONS_TO_TRACE_INTERVAL_DAYS,
+} from "./constants";
 import type { TraceDeleteBatchActionCursor } from "../../features/batchAction/types";
 import {
   findUiColumnMapping,
@@ -611,37 +614,63 @@ export const getObservationMetricsForPromptsFromEvents = async (
     toTimestamp,
   }: { fromTimestamp?: Date; toTimestamp?: Date } = {},
 ) => {
-  const queryBuilder = new CTEQueryBuilder()
-    .withCTE(
-      "prompt_events",
-      promptEventsForMetrics({
-        projectId,
-        promptIds,
-        ...(fromTimestamp
-          ? { fromTimestamp: convertDateToClickhouseDateTime(fromTimestamp) }
-          : {}),
-        ...(toTimestamp
-          ? { toTimestamp: convertDateToClickhouseDateTime(toTimestamp) }
-          : {}),
-      }),
+  const builder = getClickhouseKysely()
+    .with("prompt_events", (db) =>
+      db
+        .selectFrom("events_core as e")
+        .select([
+          "e.project_id as project_id",
+          "e.prompt_id as prompt_id",
+          "e.prompt_version as prompt_version",
+          "e.trace_id as trace_id",
+          "e.span_id as span_id",
+          "e.start_time as start_time",
+          "e.end_time as end_time",
+          "e.usage_details as usage_details",
+          "e.cost_details as cost_details",
+          "e.is_deleted as is_deleted",
+        ])
+        .where(sql<SqlBool>`e.type = 'GENERATION'`)
+        .where("e.prompt_id", "in", promptIds)
+        .$if(fromTimestamp != null, (qb) =>
+          qb.where(
+            "e.start_time",
+            ">=",
+            dateTimeParam(convertDateToClickhouseDateTime(fromTimestamp!)),
+          ),
+        )
+        .$if(toTimestamp != null, (qb) =>
+          qb.where(
+            "e.start_time",
+            "<=",
+            dateTimeParam(convertDateToClickhouseDateTime(toTimestamp!)),
+          ),
+        )
+        .orderBy("e.event_ts", "desc")
+        .$call(limitBy({ count: 1, columns: ["e.span_id", "e.project_id"] })),
     )
-    .from("prompt_events", "e")
-    .select(
-      "count(*) AS count",
-      "e.prompt_id AS prompt_id",
-      "e.prompt_version AS prompt_version",
-      "min(e.start_time) AS first_observation",
-      "max(e.start_time) AS last_observation",
-      "medianExact(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, e.usage_details)))) AS median_input_usage",
-      "medianExact(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, e.usage_details)))) AS median_output_usage",
-      "medianExact(e.cost_details['total']) AS median_total_cost",
-      "medianExact(dateDiff('millisecond', e.start_time, e.end_time)) AS median_latency_ms",
-    )
-    .whereRaw("e.is_deleted = 0")
-    .groupBy("e.prompt_id", "e.prompt_version")
-    .orderBy("ORDER BY e.prompt_version DESC");
-
-  const { query, params } = queryBuilder.buildWithParams();
+    .selectFrom("prompt_events as e")
+    .select((eb) => [
+      eb.fn.countAll().as("count"),
+      "e.prompt_id as prompt_id",
+      "e.prompt_version as prompt_version",
+      eb.fn.min("e.start_time").as("first_observation"),
+      eb.fn.max("e.start_time").as("last_observation"),
+      sql`medianExact(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'input') > 0, e.usage_details))))`.as(
+        "median_input_usage",
+      ),
+      sql`medianExact(arraySum(mapValues(mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, e.usage_details))))`.as(
+        "median_output_usage",
+      ),
+      sql`medianExact(e.cost_details['total'])`.as("median_total_cost"),
+      sql`medianExact(dateDiff('millisecond', e.start_time, e.end_time))`.as(
+        "median_latency_ms",
+      ),
+    ])
+    .where(sql<SqlBool>`e.is_deleted = 0`)
+    .groupBy(["e.prompt_id", "e.prompt_version"])
+    .orderBy("e.prompt_version", "desc");
+  const { sql: query, params } = compileClickhouseQuery(builder, { projectId });
   const rows = await queryClickhouse<{
     count: string;
     prompt_id: string;
@@ -680,29 +709,31 @@ export const getObservationsWithPromptNameFromEvents = async (
     toTimestamp,
   }: { fromTimestamp?: Date; toTimestamp?: Date } = {},
 ) => {
-  const query = `
-  SELECT uniq(span_id) as count, prompt_name
-  FROM events_core
-  WHERE project_id = {projectId: String}
-  AND prompt_name IN ({promptNames: Array(String)})
-  AND prompt_name != ''
-  AND is_deleted = 0
-  ${fromTimestamp ? "AND start_time >= {fromTimestamp: DateTime64(6)}" : ""}
-  ${toTimestamp ? "AND start_time <= {toTimestamp: DateTime64(6)}" : ""}
-  GROUP BY prompt_name
-`;
+  const builder = getClickhouseKysely()
+    .selectFrom("events_core")
+    .select((eb) => [eb.fn("uniq", ["span_id"]).as("count"), "prompt_name"])
+    .where("prompt_name", "in", promptNames)
+    .where(sql<SqlBool>`prompt_name != ''`)
+    .where(sql<SqlBool>`is_deleted = 0`)
+    .$if(fromTimestamp != null, (qb) =>
+      qb.where(
+        "start_time",
+        ">=",
+        dateTimeParam(convertDateToClickhouseDateTime(fromTimestamp!)),
+      ),
+    )
+    .$if(toTimestamp != null, (qb) =>
+      qb.where(
+        "start_time",
+        "<=",
+        dateTimeParam(convertDateToClickhouseDateTime(toTimestamp!)),
+      ),
+    )
+    .groupBy("prompt_name");
+  const { sql: query, params } = compileClickhouseQuery(builder, { projectId });
   const rows = await queryClickhouse<{ count: string; prompt_name: string }>({
     query,
-    params: {
-      projectId,
-      promptNames,
-      fromTimestamp: fromTimestamp
-        ? convertDateToClickhouseDateTime(fromTimestamp)
-        : undefined,
-      toTimestamp: toTimestamp
-        ? convertDateToClickhouseDateTime(toTimestamp)
-        : undefined,
-    },
+    params,
     tags: { projectId },
     preferredClickhouseService: "EventsReadOnly",
   });
@@ -1028,7 +1059,7 @@ export const getObservationByIdFromEventsTable = async ({
 const EVENTS_METADATA_MAP_SQL =
   "mapFromArrays(arrayReverse(e.metadata_names), arrayReverse(e.metadata_values))";
 
-/** ClickHouse DateTime64(3) binds stay strings; the column type is Date. */
+/** ClickHouse DateTime binds stay strings; the column type is Date. */
 function dateTimeParam(value: string): Date {
   return value as unknown as Date;
 }
@@ -1259,7 +1290,7 @@ export const getTraceByIdFromEventsTable = async ({
   return res.shift();
 };
 
-function traceAggregationSelects() {
+export function traceAggregationSelects() {
   return Object.values(EVENTS_AGGREGATION_FIELDS).map((field) =>
     sql.raw(field),
   );
@@ -3857,20 +3888,31 @@ export const getSessionMetricsFromEvents = async (props: {
 }) => {
   if (props.sessionIds.length === 0) return [];
 
-  const builder = eventsSessionsAggregation({
-    projectId: props.projectId,
-    sessionIds: props.sessionIds,
-    startTimeFrom: props.queryFromTimestamp
-      ? convertDateToClickhouseDateTime(props.queryFromTimestamp)
-      : undefined,
-  }).limit(props.sessionIds.length);
-
-  const { query, params } = builder.buildWithParams();
+  const { projectId, sessionIds, queryFromTimestamp } = props;
+  const builder = getClickhouseKysely()
+    .selectFrom("events_core as e")
+    .select(
+      SESSION_AGGREGATION_FIELD_SETS.base.map((field) =>
+        sql.raw(EVENTS_SESSION_AGGREGATION_FIELDS[field]),
+      ) as never,
+    )
+    .where("session_id", "in", sessionIds)
+    .$if(queryFromTimestamp != null, (qb) =>
+      qb.where(
+        "start_time",
+        ">=",
+        sql<Date>`${convertDateToClickhouseDateTime(queryFromTimestamp!)} - ${sql.raw(OBSERVATIONS_TO_TRACE_INTERVAL)}`,
+      ),
+    )
+    .where(sql<SqlBool>`session_id != ''`)
+    .groupBy("session_id")
+    .limit(sessionIds.length);
+  const { sql: query, params } = compileClickhouseQuery(builder, { projectId });
 
   const rows = await queryClickhouse<SessionEventsMetricsRow>({
     query,
     params,
-    tags: { projectId: props.projectId },
+    tags: { projectId },
     preferredClickhouseService: "EventsReadOnly",
   });
 
@@ -3910,8 +3952,38 @@ export async function getLatestSdkVersionInfoFromEvents(params: {
 }): Promise<SdkMetadata> {
   const { projectId } = params;
 
-  // Time filter: last 7 days
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const since = dateTimeParam(convertDateToClickhouseDateTime(sevenDaysAgo));
+  const builder = getClickhouseKysely()
+    .selectFrom("events_core as e")
+    .select((eb) => [
+      "e.ingestion_sdk_name as ingestion_sdk_name",
+      "e.ingestion_sdk_version as ingestion_sdk_version",
+      "e.telemetry_sdk_language as telemetry_sdk_language",
+      eb.fn.min("e.start_time").as("first_seen"),
+      eb.fn.max("e.start_time").as("last_seen"),
+      eb.fn("count", []).as("event_count"),
+    ])
+    .where("e.start_time", ">=", since)
+    .where((eb) =>
+      eb(
+        eb.fn("toDate", ["e.start_time"]),
+        ">=",
+        eb.fn("toDate", [eb.val(since)]),
+      ),
+    )
+    .where(sql<SqlBool>`startsWith(e.source, 'otel')`)
+    .where("e.ingestion_sdk_name", "not in", [...INTERNAL_INGESTION_SDK_NAMES])
+    .where(sql<SqlBool>`e.is_deleted = 0`)
+    .groupBy([
+      "e.ingestion_sdk_name",
+      "e.ingestion_sdk_version",
+      "e.telemetry_sdk_language",
+    ])
+    .orderBy("last_seen", "desc");
+  const { sql: query, params: queryParams } = compileClickhouseQuery(builder, {
+    projectId,
+  });
   const result = await queryClickhouse<{
     ingestion_sdk_name: string;
     ingestion_sdk_version: string;
@@ -3920,33 +3992,8 @@ export async function getLatestSdkVersionInfoFromEvents(params: {
     last_seen: string;
     event_count: string;
   }>({
-    query: `
-SELECT
-  e.ingestion_sdk_name AS ingestion_sdk_name,
-  e.ingestion_sdk_version AS ingestion_sdk_version,
-  e.telemetry_sdk_language AS telemetry_sdk_language,
-  min(e.start_time) AS first_seen,
-  max(e.start_time) AS last_seen,
-  count() AS event_count
-FROM events_core e
-WHERE
-  e.project_id = {projectId: String}
-  AND e.start_time >= {sevenDaysAgo: DateTime64(3)}
-  AND toDate(e.start_time) >= toDate({sevenDaysAgo: DateTime64(3)})
-  AND startsWith(e.source, 'otel')
-  AND e.ingestion_sdk_name NOT IN {internalSdkNames: Array(String)}
-  AND e.is_deleted = 0
-GROUP BY
-  e.ingestion_sdk_name,
-  e.ingestion_sdk_version,
-  e.telemetry_sdk_language
-ORDER BY last_seen DESC
-    `,
-    params: {
-      projectId,
-      sevenDaysAgo: convertDateToClickhouseDateTime(sevenDaysAgo),
-      internalSdkNames: [...INTERNAL_INGESTION_SDK_NAMES],
-    },
+    query,
+    params: queryParams,
     tags: { projectId },
     preferredClickhouseService: "EventsReadOnly",
   });

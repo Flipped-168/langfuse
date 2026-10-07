@@ -1,14 +1,17 @@
 import {
+  AliasNode,
   BinaryOperationNode,
   ColumnNode,
   CreateTableNode,
   CreateViewNode,
   DefaultQueryCompiler,
   FunctionNode,
+  IdentifierNode,
   InsertQueryNode,
   ParensNode,
   ReferenceNode,
   SetOperationNode,
+  TableNode,
   ValueNode,
   type OperationNode,
   type PrimitiveValueListNode,
@@ -25,7 +28,7 @@ import {
   type ClickHouseSelectQueryNode,
   type LimitByNode,
 } from "./nodes";
-import { COLUMN_BIND_TYPES } from "./schema";
+import { COLUMN_BIND_TYPES, TABLE_BIND_TYPES } from "./schema";
 import { assertTenancyStamped } from "./tenancy";
 
 const ARRAY_JOIN_SQL: Record<ArrayJoinNode["variant"], string> = {
@@ -93,6 +96,12 @@ export class ClickHouseQueryCompiler extends DefaultQueryCompiler {
    * column is in scope.
    */
   private pendingBindType: string | undefined;
+  /**
+   * One entry per enclosing SELECT: its FROM/JOIN names and aliases, mapped to
+   * the registry table they read, or `undefined` for a CTE or subquery.
+   */
+  private relationScopes: Map<string, string | undefined>[] = [];
+  private cteNames: string[] = [];
 
   constructor() {
     super();
@@ -128,6 +137,8 @@ export class ClickHouseQueryCompiler extends DefaultQueryCompiler {
   compileQuery(node: RootOperationNode, queryId: QueryId) {
     this.namedParameters = {};
     this.intern = new Map();
+    this.relationScopes = [];
+    this.cteNames = [];
     assertTenancyStamped(node);
     return super.compileQuery(node, queryId);
   }
@@ -155,8 +166,8 @@ export class ClickHouseQueryCompiler extends DefaultQueryCompiler {
    */
   protected override visitBinaryOperation(node: BinaryOperationNode): void {
     const columnType =
-      bindTypeOfColumnOperand(node.leftOperand) ??
-      bindTypeOfColumnOperand(node.rightOperand);
+      this.bindTypeOfColumnOperand(node.leftOperand) ??
+      this.bindTypeOfColumnOperand(node.rightOperand);
     const previous = this.pendingBindType;
     if (columnType) this.pendingBindType = columnType;
     super.visitBinaryOperation(node);
@@ -204,12 +215,100 @@ export class ClickHouseQueryCompiler extends DefaultQueryCompiler {
     // own LIMIT / OFFSET / literals with the outer column's bind type, so we
     // clear the pending bind type across the (forked) body and restore it after.
     const previousBindType = this.pendingBindType;
+    const previousCteCount = this.cteNames.length;
     this.pendingBindType = undefined;
+    for (const cte of node.with?.expressions ?? []) {
+      this.cteNames.push(cte.name.table.table.identifier.name);
+    }
+    this.relationScopes.push(this.relationScopeOf(node));
     try {
       this.visitSelectQueryBody(node);
     } finally {
+      this.relationScopes.pop();
+      this.cteNames.length = previousCteCount;
       this.pendingBindType = previousBindType;
     }
+  }
+
+  private relationScopeOf(
+    node: SelectQueryNode,
+  ): Map<string, string | undefined> {
+    const scope = new Map<string, string | undefined>();
+    const relations = [
+      ...(node.from?.froms ?? []),
+      ...(node.joins ?? []).map((join) => join.table),
+    ];
+    for (const wrapped of relations) {
+      // FINAL wraps the whole relation, alias included: `scores AS s FINAL`.
+      const maybeFinal: { kind: string } = wrapped;
+      const relation = FinalTableNode.is(maybeFinal)
+        ? maybeFinal.table
+        : wrapped;
+      const aliased = AliasNode.is(relation) ? relation : undefined;
+      const tableNode = aliased ? aliased.node : relation;
+      const table = TableNode.is(tableNode)
+        ? tableNode.table.identifier.name
+        : undefined;
+      const registryTable =
+        table && !this.cteNames.includes(table) && table in TABLE_BIND_TYPES
+          ? table
+          : undefined;
+      if (table) scope.set(table, registryTable);
+      if (aliased && IdentifierNode.is(aliased.alias)) {
+        scope.set(aliased.alias.name, registryTable);
+      }
+    }
+    return scope;
+  }
+
+  /** Registry bind type of `column`, resolved through the enclosing FROMs. */
+  private columnBindType(
+    column: string,
+    qualifier: string | undefined,
+  ): string | undefined {
+    if (qualifier) {
+      for (let i = this.relationScopes.length - 1; i >= 0; i--) {
+        const scope = this.relationScopes[i];
+        if (!scope.has(qualifier)) continue;
+        const table = scope.get(qualifier);
+        return table
+          ? TABLE_BIND_TYPES[table][column]
+          : COLUMN_BIND_TYPES[column];
+      }
+      return COLUMN_BIND_TYPES[column];
+    }
+    const scope = this.relationScopes.at(-1);
+    const candidates = new Set(
+      [...new Set(scope?.values() ?? [])]
+        .map((table) => (table ? TABLE_BIND_TYPES[table][column] : undefined))
+        .filter((bindType): bindType is string => bindType !== undefined),
+    );
+    return candidates.size === 1
+      ? [...candidates][0]
+      : COLUMN_BIND_TYPES[column];
+  }
+
+  private bindTypeOfColumnOperand(node: OperationNode): string | undefined {
+    if (ColumnNode.is(node)) {
+      return this.columnBindType(node.column.name, undefined);
+    }
+    if (ReferenceNode.is(node) && ColumnNode.is(node.column)) {
+      return this.columnBindType(
+        node.column.column.name,
+        node.table?.table.identifier.name,
+      );
+    }
+    // Single-argument date wrappers (`toDate(timestamp)`) keep the inner
+    // column's bind type. Extra arguments such as a timezone are not column
+    // values.
+    if (
+      FunctionNode.is(node) &&
+      DATE_WRAPPER_FNS.has(node.func) &&
+      node.arguments.length === 1
+    ) {
+      return this.bindTypeOfColumnOperand(node.arguments[0]);
+    }
+    return undefined;
   }
 
   /**
@@ -389,22 +488,4 @@ export class ClickHouseQueryCompiler extends DefaultQueryCompiler {
     this.namedParameters[name] = value;
     return `{${name}:${inferred}}`;
   }
-}
-
-function bindTypeOfColumnOperand(node: OperationNode): string | undefined {
-  if (ColumnNode.is(node)) return COLUMN_BIND_TYPES[node.column.name];
-  if (ReferenceNode.is(node) && ColumnNode.is(node.column)) {
-    return COLUMN_BIND_TYPES[node.column.column.name];
-  }
-  // Single-argument date wrappers (`toDate(timestamp)`) keep the inner
-  // column's bind type so the compared value is still DateTime64(3). Extra
-  // arguments such as a timezone are not column values.
-  if (
-    FunctionNode.is(node) &&
-    DATE_WRAPPER_FNS.has(node.func) &&
-    node.arguments.length === 1
-  ) {
-    return bindTypeOfColumnOperand(node.arguments[0]);
-  }
-  return undefined;
 }

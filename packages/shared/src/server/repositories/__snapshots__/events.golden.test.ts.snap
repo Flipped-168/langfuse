@@ -21,7 +21,7 @@ exports[`golden: events point-reads & existence family > getAgentGraphDataFromEv
     mapFromArrays(arrayReverse(e.metadata_names), arrayReverse(e.metadata_values))['langgraph_node'] AS node,
     mapFromArrays(arrayReverse(e.metadata_names), arrayReverse(e.metadata_values))['langgraph_step'] AS step
 FROM events_core AS e
-WHERE (e.project_id = {param1:String}) AND (e.trace_id = {param2:String}) AND (e.start_time >= {param3:DateTime64(3)}) AND (e.start_time <= {param4:DateTime64(3)})",
+WHERE (e.project_id = {param1:String}) AND (e.trace_id = {param2:String}) AND (e.start_time >= {param3:DateTime64(6)}) AND (e.start_time <= {param4:DateTime64(6)})",
   },
 ]
 `;
@@ -336,7 +336,7 @@ exports[`golden: events point-reads & existence family > getObservationByIdFromE
     e.tags AS tags,
     e.release AS release
 FROM events_core AS e
-WHERE (e.project_id = {param1:String}) AND (span_id = {param2:String}) AND (toStartOfMinute(start_time) = toStartOfMinute({param3:DateTime64(3)})) AND (start_time >= {param4:DateTime64(3)}) AND (type = {param5:String}) AND (trace_id = {param6:String})
+WHERE (e.project_id = {param1:String}) AND (span_id = {param2:String}) AND (toStartOfMinute(start_time) = toStartOfMinute({param3:DateTime64(6)})) AND (start_time >= {param4:DateTime64(6)}) AND (type = {param5:String}) AND (trace_id = {param6:String})
 ORDER BY
     start_time DESC,
     event_ts DESC
@@ -648,7 +648,7 @@ exports[`golden: events point-reads & existence family > getTraceByIdFromEventsT
             argMaxIf(evaluation_rule_id, event_ts, evaluation_rule_id != '') AS evaluation_rule_id,
             any(experiment_id) AS experiment_id
         FROM events_full AS e
-        WHERE (e.project_id = {param1:String}) AND (trace_id IN ({param2:Array(String)})) AND (start_time >= {param3:DateTime64(3)})
+        WHERE (e.project_id = {param1:String}) AND (trace_id IN ({param2:Array(String)})) AND (start_time >= {param3:DateTime64(6)})
         GROUP BY
             trace_id,
             project_id
@@ -893,7 +893,7 @@ exports[`golden: events simple aggregates family > getLatestSdkVersionInfoFromEv
     max(e.start_time) AS last_seen,
     count() AS event_count
 FROM events_core AS e
-WHERE (e.project_id = {param1:String}) AND (e.start_time >= {param2:DateTime64(3)}) AND (toDate(e.start_time) >= toDate({param2:DateTime64(3)})) AND startsWith(e.source, 'otel') AND (e.ingestion_sdk_name NOT IN ({param3:Array(String)})) AND (e.is_deleted = 0)
+WHERE (e.project_id = {param1:String}) AND (e.start_time >= {param2:DateTime64(6)}) AND (toDate(e.start_time) >= toDate({param2:DateTime64(6)})) AND startsWith(e.source, 'otel') AND (e.ingestion_sdk_name NOT IN ({param3:Array(String)})) AND (e.is_deleted = 0)
 GROUP BY
     e.ingestion_sdk_name,
     e.ingestion_sdk_version,
@@ -1321,7 +1321,7 @@ exports[`golden: events simple aggregates family > getSessionMetricsFromEvents s
 FROM events_core AS e
 WHERE (e.project_id = {param1:String}) AND (session_id IN ({param2:Array(String)})) AND (session_id != '')
 GROUP BY session_id
-LIMIT {param3:Int32}",
+LIMIT {param3:Int64}",
   },
 ]
 `;
@@ -1368,9 +1368,9 @@ exports[`golden: events simple aggregates family > getSessionMetricsFromEvents s
     ) AS session_output_usage,
     sumMap(usage_details)['total'] AS session_total_usage
 FROM events_core AS e
-WHERE (e.project_id = {param1:String}) AND (session_id IN ({param2:Array(String)})) AND (start_time >= ({param3:DateTime64(3)} - toIntervalDay(2))) AND (session_id != '')
+WHERE (e.project_id = {param1:String}) AND (session_id IN ({param2:Array(String)})) AND (start_time >= ({param3:DateTime64(6)} - toIntervalDay(2))) AND (session_id != '')
 GROUP BY session_id
-LIMIT {param4:Int32}",
+LIMIT {param4:Int64}",
   },
 ]
 `;

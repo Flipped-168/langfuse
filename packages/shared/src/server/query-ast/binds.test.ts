@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { compileClickhouseQuery } from "./compile";
 import { getClickhouseKysely } from "./dialect";
+import { useFinal } from "./extensions";
 
 const ctx = { projectId: "proj-1" };
 
@@ -45,7 +46,7 @@ describe("typed params from the column registry", () => {
     expect(sql).not.toMatch(/metadata_names in \(\{p\d+:Array\(String\)\}\)/);
   });
 
-  it("keeps DateTime64(3) when comparing through toStartOfMinute / toDate", () => {
+  it("keeps the column's DateTime precision through toStartOfMinute / toDate", () => {
     const start = "2026-01-01 00:00:00.000";
     const { sql: minuteSql } = compile(
       getClickhouseKysely()
@@ -60,7 +61,7 @@ describe("typed params from the column registry", () => {
         ),
     );
     expect(minuteSql).toMatch(
-      /toStartOfMinute\(start_time\) = toStartOfMinute\(\{p\d+:DateTime64\(3\)\}\)/,
+      /toStartOfMinute\(start_time\) = toStartOfMinute\(\{p\d+:DateTime64\(6\)\}\)/,
     );
 
     const { sql: dateSql } = compile(
@@ -78,6 +79,93 @@ describe("typed params from the column registry", () => {
     expect(dateSql).toMatch(
       /toDate\(t\.timestamp\) = toDate\(\{p\d+:DateTime64\(3\)\}\)/,
     );
+  });
+
+  it("binds a shared column name with the type of the table it is read from", () => {
+    const start = "2026-01-01 00:00:00.000";
+    const { sql } = compile(
+      getClickhouseKysely()
+        .selectFrom("events_core as e")
+        .select("e.span_id")
+        .where("e.start_time", ">=", start as unknown as Date)
+        .where("e.trace_id", "in", (qb) =>
+          qb
+            .selectFrom("observations")
+            .select("trace_id")
+            .where("start_time", ">=", start as unknown as Date),
+        ),
+    );
+    expect(sql).toMatch(/e\.start_time >= \{p\d+:DateTime64\(6\)\}/);
+    expect(sql).toMatch(
+      /where project_id = .* and start_time >= \{p\d+:DateTime64\(3\)\}/,
+    );
+  });
+
+  it("resolves the bind type through a FINAL table", () => {
+    const start = "2026-01-01 00:00:00.000" as unknown as Date;
+    const { sql } = compile(
+      getClickhouseKysely()
+        .selectFrom("scores as s")
+        .select("s.id")
+        .where("s.event_ts", ">=", start)
+        .$call(useFinal(["scores"])),
+    );
+    expect(sql).toMatch(/s\.event_ts >= \{p\d+:DateTime64\(3\)\}/);
+  });
+
+  it("resolves a qualifier declared in an enclosing select", () => {
+    const start = "2026-01-01 00:00:00.000" as unknown as Date;
+    const { sql } = compile(
+      getClickhouseKysely()
+        .selectFrom("events_core as e")
+        .select("e.span_id")
+        .where(({ exists, selectFrom }) =>
+          exists(
+            selectFrom("observations as o")
+              .select("o.trace_id")
+              .where("e.start_time", ">=", start),
+          ),
+        ),
+    );
+    expect(sql).toMatch(/e\.start_time >= \{p\d+:DateTime64\(6\)\}/);
+  });
+
+  // Without a registry table to resolve against, the bind type falls back to
+  // the JS value: a DateTime string binds as String.
+  it.each([
+    [
+      "a CTE named like a registry table",
+      () =>
+        getClickhouseKysely()
+          .with("observations", (db) =>
+            db.selectFrom("events_core").select("start_time"),
+          )
+          .selectFrom("observations")
+          .select("start_time")
+          .where("start_time", ">=", "2026-01-01 00:00:00.000" as never),
+    ],
+    [
+      "an aliased subquery in FROM",
+      () =>
+        getClickhouseKysely()
+          .selectFrom((db) =>
+            db.selectFrom("events_core").select("start_time").as("sub"),
+          )
+          .select("sub.start_time")
+          .where("sub.start_time", ">=", "2026-01-01 00:00:00.000" as never),
+    ],
+    [
+      "a JOIN where an unqualified column exists with different types",
+      () =>
+        getClickhouseKysely()
+          .selectFrom("events_core as e")
+          .innerJoin("observations as o", "o.trace_id", "e.trace_id")
+          .select("e.span_id")
+          .where("start_time", ">=", "2026-01-01 00:00:00.000" as never),
+    ],
+  ])("falls back to value inference for %s", (_, build) => {
+    const { sql } = compile(build());
+    expect(sql).toMatch(/start_time >= \{p\d+:String\}/);
   });
 
   it("does not type extra date-wrapper arguments as the column", () => {
