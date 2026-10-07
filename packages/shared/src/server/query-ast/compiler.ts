@@ -17,6 +17,7 @@ import {
   type ValueListNode,
 } from "kysely";
 import type { QueryId } from "kysely";
+import { TupleParam } from "@clickhouse/client";
 
 import {
   ArrayJoinNode,
@@ -46,6 +47,9 @@ const DATE_WRAPPER_FNS = new Set([
 
 function canonicalParamValue(value: unknown): string {
   if (value instanceof Date) return `d:${value.toISOString()}`;
+  if (value instanceof TupleParam) {
+    return `t:${JSON.stringify(value.values)}`;
+  }
   if (Array.isArray(value)) {
     return `a:${JSON.stringify(value)}`;
   }
@@ -54,6 +58,9 @@ function canonicalParamValue(value: unknown): string {
 
 function inferClickHouseType(value: unknown): string {
   if (value instanceof Date) return "DateTime64(3)";
+  if (value instanceof TupleParam) {
+    return `Tuple(${value.values.map(inferClickHouseType).join(", ")})`;
+  }
   if (Array.isArray(value)) {
     const inner = value.length === 0 ? "String" : inferClickHouseType(value[0]);
     return `Array(${inner})`;
