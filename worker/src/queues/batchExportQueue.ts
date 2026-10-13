@@ -1,4 +1,4 @@
-import { Job } from "bullmq";
+import { DelayedError, Job } from "bullmq";
 
 import {
   BaseError,
@@ -9,7 +9,12 @@ import { prisma } from "@langfuse/shared/src/db";
 
 import { traceException, logger } from "@langfuse/shared/src/server";
 import { QueueName, TQueueJobTypes } from "@langfuse/shared/src/server";
-import { handleBatchExportJob } from "../features/batchExport/handleBatchExportJob";
+import {
+  BatchExportProjectBusyError,
+  handleBatchExportJob,
+} from "../features/batchExport/handleBatchExportJob";
+
+const PROJECT_BUSY_RETRY_DELAY_MS = 30_000;
 
 export const batchExportQueueProcessor = async (
   job: Job<TQueueJobTypes[QueueName.BatchExport]>,
@@ -22,6 +27,14 @@ export const batchExportQueueProcessor = async (
 
     return true;
   } catch (e) {
+    if (e instanceof BatchExportProjectBusyError) {
+      logger.info(`[BATCH EXPORT] ${e.message}`);
+      await job.moveToDelayed(
+        Date.now() + PROJECT_BUSY_RETRY_DELAY_MS,
+        job.token,
+      );
+      throw new DelayedError();
+    }
     if (e instanceof LangfuseNotFoundError) {
       logger.warn(
         `[BATCH EXPORT] Batch export ${job.data.payload.batchExportId} not found. Job will be skipped.`,

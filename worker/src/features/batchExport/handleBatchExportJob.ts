@@ -51,6 +51,48 @@ const isCausedBy = (error: unknown, target: unknown): boolean => {
   return false;
 };
 
+// A PROCESSING export older than this is treated as abandoned (e.g. its worker
+// died) so it cannot block the project's queue forever.
+const STALE_PROCESSING_EXPORT_MS = 60 * 60 * 1000;
+
+export class BatchExportProjectBusyError extends Error {
+  constructor(projectId: string, batchExportId: string) {
+    super(
+      `Project ${projectId} is at its concurrent batch export limit; deferring ${batchExportId}`,
+    );
+    this.name = "BatchExportProjectBusyError";
+  }
+}
+
+// Marks the export PROCESSING unless the project already runs the maximum
+// number of exports. The advisory lock serializes claims across workers.
+export const claimProjectExportSlot = async ({
+  projectId,
+  batchExportId,
+}: {
+  projectId: string;
+  batchExportId: string;
+}): Promise<boolean> =>
+  prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`batch-export:${projectId}`}, 0))`;
+
+    const running = await tx.batchExport.count({
+      where: {
+        projectId,
+        id: { not: batchExportId },
+        status: BatchExportStatus.PROCESSING,
+        updatedAt: { gte: new Date(Date.now() - STALE_PROCESSING_EXPORT_MS) },
+      },
+    });
+    if (running >= env.BATCH_EXPORT_MAX_CONCURRENT_PER_PROJECT) return false;
+
+    await tx.batchExport.update({
+      where: { id: batchExportId, projectId },
+      data: { status: BatchExportStatus.PROCESSING },
+    });
+    return true;
+  });
+
 export const handleBatchExportJob = async (
   batchExportJob: BatchExportJobType,
 ) => {
@@ -131,16 +173,9 @@ export const handleBatchExportJob = async (
     );
   }
 
-  // Set job status to processing
-  await prisma.batchExport.update({
-    where: {
-      id: batchExportId,
-      projectId,
-    },
-    data: {
-      status: BatchExportStatus.PROCESSING,
-    },
-  });
+  if (!(await claimProjectExportSlot({ projectId, batchExportId }))) {
+    throw new BatchExportProjectBusyError(projectId, batchExportId);
+  }
 
   // Parse query from job
   const parsedQuery = BatchExportQuerySchema.safeParse(jobDetails.query);

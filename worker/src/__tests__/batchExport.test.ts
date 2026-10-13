@@ -18,10 +18,12 @@ import {
 } from "@langfuse/shared/src/server";
 import {
   BatchExportFileFormat,
+  BatchExportStatus,
   BatchExportTableName,
   DatasetStatus,
 } from "@langfuse/shared";
 import { prisma } from "@langfuse/shared/src/db";
+import { claimProjectExportSlot } from "../features/batchExport/handleBatchExportJob";
 import { getDatabaseReadStreamPaginated } from "../features/database-read-stream/getDatabaseReadStream";
 import { getObservationStream } from "../features/database-read-stream/observation-stream";
 import { getTraceStream } from "../features/database-read-stream/trace-stream";
@@ -5330,5 +5332,70 @@ maybeDescribe("getEventsForBlobStorageExport", () => {
     expect(Object.keys(rows[0]).sort()).toEqual(expectedColumns);
     expect(rows[0].input).toBe("hello");
     expect(rows[0].output).toBe("world");
+  });
+});
+
+describe("batch export per-project concurrency", () => {
+  const createExport = (
+    projectId: string,
+    status: BatchExportStatus,
+    updatedAt?: Date,
+  ) =>
+    prisma.batchExport.create({
+      data: {
+        projectId,
+        userId: "user-1",
+        name: "export",
+        status,
+        format: BatchExportFileFormat.CSV,
+        query: {},
+        ...(updatedAt ? { updatedAt } : {}),
+      },
+    });
+
+  it("lets exactly one of two concurrent exports in a project start", async () => {
+    const { projectId } = await createOrgProjectAndApiKey();
+    const [a, b] = await Promise.all([
+      createExport(projectId, BatchExportStatus.QUEUED),
+      createExport(projectId, BatchExportStatus.QUEUED),
+    ]);
+
+    const claims = await Promise.all(
+      [a, b].map((e) =>
+        claimProjectExportSlot({ projectId, batchExportId: e.id }),
+      ),
+    );
+
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const exports = await prisma.batchExport.findMany({ where: { projectId } });
+    expect(exports.map((e) => e.status).sort()).toEqual([
+      BatchExportStatus.PROCESSING,
+      BatchExportStatus.QUEUED,
+    ]);
+  });
+
+  it("ignores other projects' and abandoned exports", async () => {
+    const { projectId } = await createOrgProjectAndApiKey();
+    const { projectId: otherProjectId } = await createOrgProjectAndApiKey();
+    await createExport(otherProjectId, BatchExportStatus.PROCESSING);
+    await createExport(
+      projectId,
+      BatchExportStatus.PROCESSING,
+      new Date(Date.now() - 2 * 60 * 60 * 1000),
+    );
+    const queued = await createExport(projectId, BatchExportStatus.QUEUED);
+
+    await expect(
+      claimProjectExportSlot({ projectId, batchExportId: queued.id }),
+    ).resolves.toBe(true);
+  });
+
+  it("lets a retried export reclaim its own slot", async () => {
+    const { projectId } = await createOrgProjectAndApiKey();
+    const running = await createExport(projectId, BatchExportStatus.PROCESSING);
+
+    await expect(
+      claimProjectExportSlot({ projectId, batchExportId: running.id }),
+    ).resolves.toBe(true);
   });
 });
