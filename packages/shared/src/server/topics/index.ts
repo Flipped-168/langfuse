@@ -11,3 +11,4 @@ export * from "./model-config";
 export * from "./setup";
 export * from "./trace-input";
 export * from "./trace-selection";
+export * from "./backfill";
