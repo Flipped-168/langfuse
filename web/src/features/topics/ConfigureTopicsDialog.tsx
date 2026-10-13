@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import { AlertTriangle, ExternalLinkIcon, Info } from "lucide-react";
 import { Alert } from "@/src/components/design-system/Alert/Alert";
 import { Button } from "@/src/components/design-system/Button/Button";
@@ -115,6 +115,8 @@ type ConfigureTopicsDialogProps = {
   projectId?: string;
   /** Storybook keeps the sample filter. The project page chooses traces when a run starts. */
   sampleScope?: boolean;
+  /** Rendered as the last step; runs the saved setup on past traces. */
+  backfill?: ReactNode;
   triggerVariant: "primary" | "secondary";
 } & (
   | { notice: "none" }
@@ -143,6 +145,7 @@ const SLOT_COPY = {
 
 export function ConfigureTopicsDialog(props: ConfigureTopicsDialogProps) {
   const {
+    backfill,
     defaultOpen,
     draft,
     canWrite = true,
@@ -401,6 +404,16 @@ export function ConfigureTopicsDialog(props: ConfigureTopicsDialogProps) {
                   onEnabledChange={setEnabled}
                 />
               </Stepper>
+              {backfill ? (
+                <Stepper
+                  number={5}
+                  title="Backfill"
+                  description="Summarize past traces with the saved setup, in the same batches as automatic processing."
+                  compactBottomSpacing
+                >
+                  {backfill}
+                </Stepper>
+              ) : null}
             </div>
             {saveError ? (
               <p className="text-destructive px-6 pb-2 text-sm">{saveError}</p>

@@ -23,6 +23,7 @@ import {
   type TopicSlotCheck,
 } from "./ConfigureTopicsDialog";
 import { topicsSetupPayload } from "./topics-setup";
+import { ProjectTopicBackfill } from "./TopicBackfill";
 
 type StoredSettings = RouterOutputs["topics"]["modelSettings"];
 type Connection = RouterOutputs["llmApiKey"]["all"]["data"][number];
@@ -370,6 +371,12 @@ function ConfigureTopicsSettings({
         );
       }}
       onSave={onSave}
+      backfill={
+        <ProjectTopicBackfill
+          projectId={projectId}
+          disabledReason={backfillDisabledReason(canWrite, stored)}
+        />
+      }
       triggerVariant={configured(stored) ? "secondary" : "primary"}
       {...(paused
         ? { notice: "paused" as const, ...paused }
@@ -392,6 +399,13 @@ function topicsStatus({
 
 function configured(stored: StoredSettings) {
   return Boolean(stored.summary && stored.embedding && stored.clustering);
+}
+
+function backfillDisabledReason(canWrite: boolean, stored: StoredSettings) {
+  if (!canWrite) return "You need permission to edit Topics to backfill.";
+  if (!stored.enabled || !configured(stored))
+    return "Backfills use automatic processing. Turn it on with three tested models and save first.";
+  return null;
 }
 
 const OPENAI_EMBEDDING_MODELS = [

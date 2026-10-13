@@ -5,6 +5,7 @@ import {
   ConfigureTopicsDialog,
   type ConfigureTopicsDraft,
 } from "./ConfigureTopicsDialog";
+import { TopicBackfillSection } from "./TopicBackfill";
 
 const providerGroups: Array<[string, string[]]> = [
   [
@@ -88,12 +89,43 @@ export const NeedsSetup = meta.story({
   },
 });
 
+const onBackfill = fn();
+
 export const Configured = meta.story({
   args: {
     draft: filledDraft,
     defaultOpen: true,
     notice: "none",
     triggerVariant: "secondary",
+    backfill: (
+      <TopicBackfillSection
+        disabledReason={null}
+        pending={false}
+        result={null}
+        onBackfill={onBackfill}
+      />
+    ),
+  },
+});
+
+export const BackfillsWithoutSaving = meta.story({
+  name: "(Test) Backfill sends source and count without saving the sheet",
+  args: Configured.input.args,
+  play: async ({ args }) => {
+    const body = within(document.body);
+    await userEvent.click(
+      body.getByRole("radio", { name: /Random traces from the last 7 days/ }),
+    );
+    const count = body.getByRole("spinbutton", {
+      name: "Number of traces to backfill",
+    });
+    await userEvent.clear(count);
+    await userEvent.type(count, "120{Enter}");
+    await userEvent.click(
+      body.getByRole("button", { name: "Backfill traces" }),
+    );
+    await expect(onBackfill).toHaveBeenCalledWith("random", 120);
+    await expect(args.onSave).not.toHaveBeenCalled();
   },
 });
 
@@ -139,6 +171,14 @@ export const Paused = meta.story({
     message:
       'The LLM connection "Amazon Bedrock" was deleted. Choose another connection, then turn on "Process new traces automatically" in Configure Topics.',
     triggerVariant: "primary",
+    backfill: (
+      <TopicBackfillSection
+        disabledReason="Backfills use automatic processing. Turn it on with three tested models and save first."
+        pending={false}
+        result={null}
+        onBackfill={onBackfill}
+      />
+    ),
   },
 });
 
