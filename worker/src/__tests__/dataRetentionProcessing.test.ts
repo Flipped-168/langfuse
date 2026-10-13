@@ -119,7 +119,7 @@ describe("DataRetentionProcessingJob", () => {
       data: {
         name: "Assistant retention test",
         retentionDays: 7,
-        org: { create: { name: "Assistant retention test" } },
+        organization: { create: { name: "Assistant retention test" } },
       },
     });
 
@@ -338,7 +338,7 @@ describe("DataRetentionProcessingJob", () => {
           name: "Assistant retention policy test",
           retentionDays,
           deletedAt,
-          org: { create: { name: "Assistant retention policy test" } },
+          organization: { create: { name: "Assistant retention policy test" } },
         },
       });
       const queryRaw = prisma.$queryRaw.bind(prisma);
@@ -383,7 +383,9 @@ describe("DataRetentionProcessingJob", () => {
         data: {
           name: "Assistant retention timezone test",
           retentionDays: 7,
-          org: { create: { name: "Assistant retention timezone test" } },
+          organization: {
+            create: { name: "Assistant retention timezone test" },
+          },
         },
       });
       const expiredId = randomUUID();
